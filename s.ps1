@@ -1,15 +1,64 @@
+# ===========================================================
+#  Setup remoto de acesso SSH - metodo DEFINITIVO (Davi)
+#  - Instala OpenSSH 9.5 (estavel) direto do GitHub release.
+#  - NAO depende do Windows Update (evita travar) e PULA a
+#    build 10.0 (que nao sobe como servico em algumas maquinas).
+#  - Idempotente: se ja estiver funcional, so reconfigura a chave.
+#  Rodar no PowerShell como ADMINISTRADOR.
+# ===========================================================
 $ProgressPreference = 'SilentlyContinue'
-Write-Host 'Instalando OpenSSH Server...'
-Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
-Set-Service sshd -StartupType Automatic
-Restart-Service sshd
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = 'Continue'
+
+$d   = "$env:ProgramFiles\OpenSSH"
+$ver = 'v9.5.0.0p1-Beta'
+$url = "https://github.com/PowerShell/Win32-OpenSSH/releases/download/$ver/OpenSSH-Win64.zip"
+$key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA5QQ5zL4TzzFcasIoDx0VNGSE3yJGqKYO/I/f3MVcX2 david-main-pc'
+$enc = New-Object System.Text.UTF8Encoding $false
+
+function Test-SshUp { [bool](Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue) }
+
+Write-Host '== Setup SSH (OpenSSH 9.5 via GitHub) =='
+
+# --- reexecucao rapida: tenta reaproveitar instalacao existente ---
+$precisaInstalar = $true
+if (Test-Path "$d\sshd.exe") {
+  Write-Host 'Instalacao encontrada - tentando subir o servico existente...'
+  Set-Service sshd -StartupType Automatic -ErrorAction SilentlyContinue
+  & sc.exe start sshd | Out-Null
+  Start-Sleep -Seconds 3
+  if (Test-SshUp) { Write-Host 'Servico ja funcional - nao reinstala.'; $precisaInstalar = $false }
+  else { Write-Host 'Servico nao subiu - reinstalando a 9.5 limpa.' }
+}
+
+if ($precisaInstalar) {
+  Write-Host 'Limpando instalacao/tarefa anterior (se houver)...'
+  Unregister-ScheduledTask -TaskName 'SSHD-Foreground' -Confirm:$false -ErrorAction SilentlyContinue
+  Stop-Service sshd -Force -ErrorAction SilentlyContinue
+  if (Test-Path "$d\uninstall-sshd.ps1") { powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$d\uninstall-sshd.ps1" | Out-Null }
+  Get-Process sshd, sshd-session -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  Start-Sleep -Seconds 1
+  if (Test-Path $d) { Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue }
+
+  Write-Host ('Baixando OpenSSH ' + $ver + ' (~16 MB)...')
+  $zip = "$env:TEMP\OpenSSH-Win64.zip"
+  Invoke-WebRequest -Uri $url -OutFile $zip
+  Expand-Archive -Path $zip -DestinationPath $env:ProgramFiles -Force
+  $ext = Join-Path $env:ProgramFiles 'OpenSSH-Win64'
+  if (Test-Path $ext) { Rename-Item $ext 'OpenSSH' -Force }
+
+  Write-Host 'Instalando servico (bypass de ExecutionPolicy)...'
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$d\install-sshd.ps1" | Out-Null
+  & "$d\ssh-keygen.exe" -A | Out-Null
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$d\FixHostFilePermissions.ps1" -Confirm:$false | Out-Null
+  Set-Service sshd -StartupType Automatic
+}
 
 Write-Host 'Liberando firewall (porta 22)...'
 Remove-NetFirewallRule -Name sshd -ErrorAction SilentlyContinue
 New-NetFirewallRule -Name sshd -DisplayName 'OpenSSH SSH Server' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
 
-$key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA5QQ5zL4TzzFcasIoDx0VNGSE3yJGqKYO/I/f3MVcX2 david-main-pc'
-$enc = New-Object System.Text.UTF8Encoding $false
+if (-not (Test-Path "$env:ProgramData\ssh")) { New-Item -ItemType Directory -Path "$env:ProgramData\ssh" | Out-Null }
 
 Write-Host 'Gravando chave (admins)...'
 $fa = "$env:ProgramData\ssh\administrators_authorized_keys"
@@ -36,8 +85,8 @@ if ($cu) {
   }
 }
 
-Restart-Service sshd
-Start-Sleep -Seconds 2
+& sc.exe start sshd | Out-Null
+Start-Sleep -Seconds 3
 
 $isadmin = $false
 if ($uname) {
@@ -46,7 +95,7 @@ if ($uname) {
   $isadmin = (($g -join "`n") -match [regex]::Escape($uname))
 }
 $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like '192.168.*' } | Select-Object -First 1).IPAddress
-$porta = if (Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue) { 'SIM' } else { 'NAO' }
+$porta = if (Test-SshUp) { 'SIM' } else { 'NAO' }
 $status = (Get-Service sshd).Status
 
 Write-Host ''
@@ -57,4 +106,4 @@ Write-Host ('  Porta 22 ouvindo : ' + $porta)
 Write-Host ('  Usuario do login : ' + $cu)
 Write-Host ('  Eh administrador : ' + $isadmin)
 Write-Host '========================================'
-Write-Host 'PRONTO'
+if ($porta -eq 'SIM') { Write-Host 'PRONTO' } else { Write-Host 'ATENCAO: porta 22 nao subiu - avisar o Davi' }
